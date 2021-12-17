@@ -1,0 +1,175 @@
+pipeline:
+    name: Terraform
+    identifier: Terraform
+    projectIdentifier: mansongSAM
+    orgIdentifier: default
+    tags: {}
+    properties:
+        ci:
+            codebase:
+                connectorRef: Github
+                repoName: ideal-potato
+                build: <+input>
+    stages:
+        - stage:
+              name: CI
+              identifier: CI
+              description: ""
+              type: CI
+              spec:
+                  cloneCodebase: true
+                  infrastructure:
+                      type: KubernetesDirect
+                      spec:
+                          connectorRef: account.mansong_gke
+                          namespace: harness-build
+                  execution:
+                      steps:
+                          - parallel:
+                                - step:
+                                      type: Run
+                                      name: fmt
+                                      identifier: fmt
+                                      spec:
+                                          connectorRef: mansongdockerhub
+                                          image: <+CI.variables.terraform_version>
+                                          command: terraform fmt -write=false -diff=true -check=true
+                                          privileged: false
+                                - step:
+                                      type: Run
+                                      name: validate
+                                      identifier: validate
+                                      spec:
+                                          connectorRef: mansongdockerhub
+                                          image: <+CI.variables.terraform_version>
+                                          command: |-
+                                              terraform init
+                                              terraform validate
+                                          privileged: false
+                                - step:
+                                      type: Run
+                                      name: tflint
+                                      identifier: tflint
+                                      spec:
+                                          connectorRef: mansongdockerhub
+                                          image: wata727/tflint
+                                          command: tflint .
+                                          privileged: false
+                                          envVariables:
+                                              TFLINT_LOG: <+CI.variables.tflint_log_level>
+                          - step:
+                                type: Run
+                                name: graph
+                                identifier: graph
+                                spec:
+                                    connectorRef: mansongdockerhub
+                                    image: <+CI.variables.terraform_version>
+                                    command: |-
+                                        apk --update-cache upgrade
+                                        apk --no-cache add graphviz
+                                        terraform graph | dot -Tpng > terraform-graph.png
+                                    privileged: false
+                          - step:
+                                type: Run
+                                name: plan
+                                identifier: plan
+                                spec:
+                                    connectorRef: mansongdockerhub
+                                    image: <+CI.variables.terraform_version>
+                                    command: terraform plan -out=tfplan -input=false
+                                    privileged: false
+                                    envVariables:
+                                        AWS_ACCESS_KEY_ID: <+secrets.getValue("samAWSKeyID")>
+                                        AWS_SECRET_ACCESS_KEY: <+secrets.getValue("samAWSSecret")>
+                          - step:
+                                type: Run
+                                name: apply
+                                identifier: apply
+                                spec:
+                                    connectorRef: mansongdockerhub
+                                    image: <+CI.variables.terraform_version>
+                                    command: terraform apply -auto-approve -input=false tfplan
+                                    privileged: false
+                                    envVariables:
+                                        AWS_ACCESS_KEY_ID: <+secrets.getValue("samAWSKeyID")>
+                                        AWS_SECRET_ACCESS_KEY: <+secrets.getValue("samAWSSecret")>
+                          - step:
+                                type: Run
+                                name: destroy
+                                identifier: destroy
+                                spec:
+                                    connectorRef: mansongdockerhub
+                                    image: <+CI.variables.terraform_version>
+                                    command: terraform destroy -auto-approve -input=false
+                                    privileged: false
+                                    envVariables:
+                                        AWS_ACCESS_KEY_ID: <+secrets.getValue("samAWSKeyID")>
+                                        AWS_SECRET_ACCESS_KEY: <+secrets.getValue("samAWSSecret")>
+              variables:
+                  - name: terraform_version
+                    type: String
+                    value: hashicorp/terraform:1.0.6
+                  - name: tflint_log_level
+                    type: String
+                    value: debug
+        - stage:
+              name: Deploy
+              identifier: Deploy
+              description: ""
+              type: Deployment
+              spec:
+                  serviceConfig:
+                      serviceRef: terraform
+                      serviceDefinition:
+                          type: Kubernetes
+                          spec:
+                              variables: []
+                  infrastructure:
+                      environmentRef: dev
+                      infrastructureDefinition:
+                          type: KubernetesDirect
+                          spec:
+                              connectorRef: account.mansong_gke
+                              namespace: harness-build
+                              releaseName: release-<+INFRA_KEY>
+                      allowSimultaneousDeployments: false
+                  execution:
+                      steps:
+                          - step:
+                                type: TerraformApply
+                                name: Apply
+                                identifier: Apply
+                                spec:
+                                    provisionerIdentifier: terraform
+                                    configuration:
+                                        type: Inline
+                                        spec:
+                                            configFiles:
+                                                store:
+                                                    type: Github
+                                                    spec:
+                                                        gitFetchType: Branch
+                                                        connectorRef: Github
+                                                        repoName: ideal-potato
+                                                        branch: main
+                                                        folderPath: "."
+                                    delegateSelectors:
+                                        - mansong-gke
+                                timeout: 10m
+                                failureStrategies: []
+                      rollbackSteps:
+                          - step:
+                                type: TerraformRollback
+                                name: Rollback
+                                identifier: Rollback
+                                spec:
+                                    provisionerIdentifier: terraform
+                                timeout: 10m
+                  serviceDependencies: []
+              tags: {}
+              failureStrategies:
+                  - onFailure:
+                        errors:
+                            - AllErrors
+                        action:
+                            type: StageRollback
